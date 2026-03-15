@@ -1,69 +1,74 @@
-#include <cmath> //数学库：计算正弦波（sin/cos）让脚踝平滑摆动
-#include <memory>
-#include <mutex>
-#include <shared_mutex>
+#include <cmath>          // 数学库：计算正弦波（sin/cos）让脚踝平滑摆动
+#include <memory>         // 智能指针：管理内存，防止内存泄漏
+#include <mutex>          // 互斥锁：防止多个线程同时改写电机指令
+#include <shared_mutex>   // 读写锁：提高效率，允许多个线程同时读取状态，但只允许一个写入
 
-#include "gamepad.hpp"
+#include "gamepad.hpp"    // 游戏手柄控制：允许你用手柄遥控脚踝的动作
 
-// DDS
-#include <unitree/robot/channel/channel_publisher.hpp>
-#include <unitree/robot/channel/channel_subscriber.hpp>
+// DDS 这是宇树机器人通信的核心。可以把它想象成机器人的“神经网络”。
+#include <unitree/robot/channel/channel_publisher.hpp>  // 发布者：负责把你的“控制指令”发给机器人
+#include <unitree/robot/channel/channel_subscriber.hpp> // 订阅者：负责接收机器人传回的“实时状态”
 
-// IDL
-#include <unitree/idl/hg/IMUState_.hpp>
-#include <unitree/idl/hg/LowCmd_.hpp>
-#include <unitree/idl/hg/LowState_.hpp>
-#include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
+// IDL 数据定义 (低层接口)  这些是由 IDL（接口定义语言）生成的结构体，定义了机器人能听懂的“语言格式”
+#include <unitree/idl/hg/IMUState_.hpp> //机器人的姿态数据（加速度、角速度、倾斜角度）
+#include <unitree/idl/hg/LowCmd_.hpp> //底层控制指令。包括每个电机的位置，比例增益，微分增益等。
+#include <unitree/idl/hg/LowState_.hpp> //底层状态反馈。告诉你电机现在的实际角度、转速和温度
+#include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp> //模式切换器
 
+//控制指令频道。Low level Command。程序计算出的电机角度、力矩等数据，都会打包发往这个频道。机器人内部的电机驱动器会监听这个频道并执行动作。
 static const std::string HG_CMD_TOPIC = "rt/lowcmd";
+//躯干惯性测量单元。专门用来获取机器人身体在空间中的平衡状态（倾斜角、加速度）。这对保持机器人不倒地非常关键。
 static const std::string HG_IMU_TORSO = "rt/secondary_imu";
+//状态反馈频道。Low level State。机器人每时每刻都在往这个频道发送它“自己”的数据（比如当前电机转到了多少度、是否有报错）。程序需要订阅它来获取反馈。
 static const std::string HG_STATE_TOPIC = "rt/lowstate";
 
 using namespace unitree::common;
 using namespace unitree::robot;
 using namespace unitree_hg::msg::dds_;
 
+//控制机器人时，通常会有两个程序在同时跑。如果接收线程正在写数据，控制线程正好在读数据，程序就会“打架”（内存冲突）。这个类就是为了解决这个冲突，确保数据读写安全的。
 template <typename T>
 class DataBuffer {
  public:
+  //存入数据 - 写入
   void SetData(const T &newData) {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    data = std::make_shared<T>(newData);
+    std::unique_lock<std::shared_mutex> lock(mutex); //锁门（独占）
+    data = std::make_shared<T>(newData);             //放入新数据
   }
 
   std::shared_ptr<const T> GetData() {
-    std::shared_lock<std::shared_mutex> lock(mutex);
-    return data ? data : nullptr;
+    std::shared_lock<std::shared_mutex> lock(mutex); //锁门（共享）
+    return data ? data : nullptr;                    //返回数据
   }
 
   void Clear() {
-    std::unique_lock<std::shared_mutex> lock(mutex);
+    std::unique_lock<std::shared_mutex> lock(mutex); //重置缓冲区。比如机器人断开连接了，旧的数据就不能再用了，必须清空防止误操作
     data = nullptr;
   }
 
  private:
-  std::shared_ptr<T> data;
-  std::shared_mutex mutex;
+  std::shared_ptr<T> data; //智能指针
+  std::shared_mutex mutex; //读写锁
 };
 
-const int G1_NUM_MOTOR = 29;
-struct ImuState {
-  std::array<float, 3> rpy = {};
-  std::array<float, 3> omega = {};
+const int G1_NUM_MOTOR = 29; //29个电机
+struct ImuState { //平衡感
+  std::array<float, 3> rpy = {}; //长度为 3 的数组，翻滚角、俯仰角、偏航角
+  std::array<float, 3> omega = {}; //长度为 3 的数组。角速度。描述机器人转动得有多快
 };
-struct MotorCommand {
-  std::array<float, G1_NUM_MOTOR> q_target = {};
-  std::array<float, G1_NUM_MOTOR> dq_target = {};
-  std::array<float, G1_NUM_MOTOR> kp = {};
-  std::array<float, G1_NUM_MOTOR> kd = {};
-  std::array<float, G1_NUM_MOTOR> tau_ff = {};
+struct MotorCommand {//控制指令 - 我下达的命令
+  std::array<float, G1_NUM_MOTOR> q_target = {}; //目标角度
+  std::array<float, G1_NUM_MOTOR> dq_target = {};//目标速度
+  std::array<float, G1_NUM_MOTOR> kp = {};       //比例增益，越大，关节越僵硬；越小，越像弹簧
+  std::array<float, G1_NUM_MOTOR> kd = {};       //微分增益。防止关节像弹簧一样来回乱晃
+  std::array<float, G1_NUM_MOTOR> tau_ff = {};   //前馈力矩。给电机的额外“推力”，通常用来抵消重力。
 };
-struct MotorState {
-  std::array<float, G1_NUM_MOTOR> q = {};
-  std::array<float, G1_NUM_MOTOR> dq = {};
+struct MotorState {//状态反馈 - 机器人告诉我的
+  std::array<float, G1_NUM_MOTOR> q = {};//实际角度
+  std::array<float, G1_NUM_MOTOR> dq = {};//实际速度
 };
 
-// Stiffness for all G1 Joints
+// Stiffness for all G1 Joints 刚度
 std::array<float, G1_NUM_MOTOR> Kp{
     60, 60, 60, 100, 40, 40,      // legs
     60, 60, 60, 100, 40, 40,      // legs
@@ -72,7 +77,7 @@ std::array<float, G1_NUM_MOTOR> Kp{
     40, 40, 40, 40,  40, 40, 40   // arms
 };
 
-// Damping for all G1 Joints
+// Damping for all G1 Joints 阻尼
 std::array<float, G1_NUM_MOTOR> Kd{
     1, 1, 1, 2, 1, 1,     // legs
     1, 1, 1, 2, 1, 1,     // legs
@@ -81,61 +86,61 @@ std::array<float, G1_NUM_MOTOR> Kd{
     1, 1, 1, 1, 1, 1, 1   // arms
 };
 
-enum class Mode {
-  PR = 0,  // Series Control for Ptich/Roll Joints
-  AB = 1   // Parallel Control for A/B Joints
+enum class Mode { //枚举类，多选菜单，模式
+  PR = 0,  // Series Control for Ptich/Roll Joints。 Pitch (俯仰)：脚尖向上勾或向下踩，Roll (翻滚)：脚板向左翻或向右翻
+  AB = 1   // Parallel Control for A/B Joints。脚踝后方那两个并排的推杆电机。
 };
 
-enum G1JointIndex {
-  LeftHipPitch = 0,
-  LeftHipRoll = 1,
-  LeftHipYaw = 2,
-  LeftKnee = 3,
-  LeftAnklePitch = 4,
-  LeftAnkleB = 4,
-  LeftAnkleRoll = 5,
-  LeftAnkleA = 5,
-  RightHipPitch = 6,
-  RightHipRoll = 7,
-  RightHipYaw = 8,
-  RightKnee = 9,
-  RightAnklePitch = 10,
-  RightAnkleB = 10,
-  RightAnkleRoll = 11,
-  RightAnkleA = 11,
-  WaistYaw = 12,
-  WaistRoll = 13,        // NOTE INVALID for g1 23dof/29dof with waist locked
-  WaistA = 13,           // NOTE INVALID for g1 23dof/29dof with waist locked
-  WaistPitch = 14,       // NOTE INVALID for g1 23dof/29dof with waist locked
-  WaistB = 14,           // NOTE INVALID for g1 23dof/29dof with waist locked
-  LeftShoulderPitch = 15,
-  LeftShoulderRoll = 16,
-  LeftShoulderYaw = 17,
-  LeftElbow = 18,
-  LeftWristRoll = 19,
-  LeftWristPitch = 20,   // NOTE INVALID for g1 23dof
-  LeftWristYaw = 21,     // NOTE INVALID for g1 23dof
-  RightShoulderPitch = 22,
-  RightShoulderRoll = 23,
-  RightShoulderYaw = 24,
-  RightElbow = 25,
-  RightWristRoll = 26,
-  RightWristPitch = 27,  // NOTE INVALID for g1 23dof
-  RightWristYaw = 28     // NOTE INVALID for g1 23dof
+enum G1JointIndex {//关节编号
+  LeftHipPitch = 0,       //左腿髋俯仰
+  LeftHipRoll = 1,        //左腿髋翻滚
+  LeftHipYaw = 2,         //左腿髋偏航
+  LeftKnee = 3,           //左腿膝
+  LeftAnklePitch = 4,     //左踝俯仰
+  LeftAnkleB = 4,         //左踝俯仰
+  LeftAnkleRoll = 5,      //左踝翻滚
+  LeftAnkleA = 5,         //左踝翻滚
+  RightHipPitch = 6,      //右腿髋俯仰
+  RightHipRoll = 7,       //右腿髋翻滚
+  RightHipYaw = 8,        //右腿髋偏航
+  RightKnee = 9,          //右腿膝
+  RightAnklePitch = 10,   //右踝俯仰
+  RightAnkleB = 10,       //右踝俯仰
+  RightAnkleRoll = 11,    //右踝翻滚
+  RightAnkleA = 11,       //右踝翻滚
+  WaistYaw = 12,          //腰偏航
+  WaistRoll = 13,         //腰翻滚       // NOTE INVALID for g1 23dof/29dof with waist locked
+  WaistA = 13,            //腰翻滚       // NOTE INVALID for g1 23dof/29dof with waist locked
+  WaistPitch = 14,        //腰俯仰       // NOTE INVALID for g1 23dof/29dof with waist locked
+  WaistB = 14,            //腰俯仰       // NOTE INVALID for g1 23dof/29dof with waist locked
+  LeftShoulderPitch = 15, //左肩俯仰
+  LeftShoulderRoll = 16,  //左肩翻滚
+  LeftShoulderYaw = 17,   //左肩偏航
+  LeftElbow = 18,         //左肘
+  LeftWristRoll = 19,     //左腕翻滚
+  LeftWristPitch = 20,    //左腕俯仰     // NOTE INVALID for g1 23dof
+  LeftWristYaw = 21,      //左腕偏航     // NOTE INVALID for g1 23dof
+  RightShoulderPitch = 22,//右肩俯仰
+  RightShoulderRoll = 23, //右肩翻滚
+  RightShoulderYaw = 24,  //右肩偏航
+  RightElbow = 25,        //右肘
+  RightWristRoll = 26,    //右腕翻滚
+  RightWristPitch = 27,   //右腕俯仰     // NOTE INVALID for g1 23dof
+  RightWristYaw = 28      //右腕偏航     // NOTE INVALID for g1 23dof
 };
-
-inline uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {
+//安检，计算校验码，确保数据包正确
+inline uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {//参数含义：uint32_t *ptr指向你要发送的数据包的指针；uint32_t len数据包的长度；返回一个 32 位的数字作为“指纹”
   uint32_t xbit = 0;
   uint32_t data = 0;
-  uint32_t CRC32 = 0xFFFFFFFF;
-  const uint32_t dwPolynomial = 0x04c11db7;
-  for (uint32_t i = 0; i < len; i++) {
+  uint32_t CRC32 = 0xFFFFFFFF;//初始值，把所有位填满
+  const uint32_t dwPolynomial = 0x04c11db7;//标尺
+  for (uint32_t i = 0; i < len; i++) {//外层循环，遍历数据包里的每一个 32 位数据
     xbit = 1 << 31;
     data = ptr[i];
-    for (uint32_t bits = 0; bits < 32; bits++) {
+    for (uint32_t bits = 0; bits < 32; bits++) {//内层循环，对每一个数据位（bit）进行复杂的位运算
       if (CRC32 & 0x80000000) {
         CRC32 <<= 1;
-        CRC32 ^= dwPolynomial;
+        CRC32 ^= dwPolynomial; //如果检测到某些特定条件，就用“标尺”去异或一下
       } else
         CRC32 <<= 1;
       if (data & xbit) CRC32 ^= dwPolynomial;
@@ -203,23 +208,25 @@ class G1Example {
     control_thread_ptr_ = CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, 2000, &G1Example::Control, this);
   }
 
-  void imuTorsoHandler(const void *message) {
-    IMUState_ imu_torso = *(const IMUState_ *)message;
-    auto &rpy = imu_torso.rpy();
-    if (counter_ % 500 == 0)
-      printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
+  //接收躯干姿态数据的回调函数
+  void imuTorsoHandler(const void *message) { //参数是一个无类型指针
+    IMUState_ imu_torso = *(const IMUState_ *)message;//告知编译器，数据包内容的格式是 IMUState_，按照这个格式解析
+    auto &rpy = imu_torso.rpy();//从解析好的数据里提取出 RPY：Roll (翻滚)：机器人左右晃不晃；Pitch (俯仰)：机器人前后倒不倒；Yaw (偏航)：机器人有没有在水平打转
+    if (counter_ % 500 == 0)//IMU数据刷新很快，每 500 次才打印一次，大约一秒钟一次，降频显示。
+      printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]); //把三个轴的角度打印出来，保留两位小数
   }
-
+//情报中心。回调函数。每当机器人发送一个LowState数据包，这个函数就会被调用。
   void LowStateHandler(const void *message) {
     LowState_ low_state = *(const LowState_ *)message;
+    //CRC检验
     if (low_state.crc() != Crc32Core((uint32_t *)&low_state, (sizeof(LowState_) >> 2) - 1)) {
       std::cout << "[ERROR] CRC Error" << std::endl;
-      return;
+      return;//如果校验码不对，直接丢弃
     }
 
     // get motor state
     MotorState ms_tmp;
-    for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+    for (int i = 0; i < G1_NUM_MOTOR; ++i) {//遍历 29 个电机，把每个电机的角度（q）和速度（dq）存好。如果电机报错，打印错误日志。
       ms_tmp.q.at(i) = low_state.motor_state()[i].q();
       ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();
       if (low_state.motor_state()[i].motorstate() && i <= RightAnkleRoll)
