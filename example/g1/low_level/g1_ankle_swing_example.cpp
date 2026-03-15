@@ -1,4 +1,4 @@
-#include <cmath>
+#include <cmath> //数学库：计算正弦波（sin/cos）让脚踝平滑摆动
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
