@@ -153,58 +153,64 @@ inline uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {//参数含义：uint32_
 
 class G1Example {
  private:
-  double time_;
-  double control_dt_;  // [2ms]
-  double duration_;    // [3 s]
-  int counter_;
-  Mode mode_pr_;
-  uint8_t mode_machine_;
+  double time_;//运行总时间
+  double control_dt_;  // [2ms]步长（2ms），决定了动作的细腻程度
+  double duration_;    // [3 s]动作切换周期
+  int counter_;//计数器，专门用来控制打印日志的频率
+  Mode mode_pr_;//记录当前是 PR 模式还是 AB 模式
+  uint8_t mode_machine_;// 记录机器人的型号状态
 
-  Gamepad gamepad_;
-  REMOTE_DATA_RX rx_;
+  Gamepad gamepad_;// 游戏手柄：把原始信号转换成“A键按下”、“左摇杆推”等语义
+  REMOTE_DATA_RX rx_;// 接收缓存：专门存放手柄发来的原始字节数据
 
-  DataBuffer<MotorState> motor_state_buffer_;
-  DataBuffer<MotorCommand> motor_command_buffer_;
-  DataBuffer<ImuState> imu_state_buffer_;
+  DataBuffer<MotorState> motor_state_buffer_;// 存：机器人现在转到哪了
+  DataBuffer<MotorCommand> motor_command_buffer_;// 存：我下令让机器人转到哪
+  DataBuffer<ImuState> imu_state_buffer_;// 存：机器人的身体歪没歪
 
-  ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
-  ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
-  ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
-  ThreadPtr command_writer_ptr_, control_thread_ptr_;
+  ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;// 发射塔：把指令发给机器人
+  ChannelSubscriberPtr<LowState_> lowstate_subscriber_;// 接收塔：收电机的状态
+  ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;// 接收塔：收身体的姿态
+  ThreadPtr command_writer_ptr_, control_thread_ptr_;// 两个并行的引擎
 
-  std::shared_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
+  std::shared_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;// 钥匙：切换机器人控制权的客户端
 
  public:
-  G1Example(std::string networkInterface)
+  G1Example(std::string networkInterface)//构造函数
       : time_(0.0),
         control_dt_(0.002),
         duration_(3.0),
         counter_(0),
         mode_pr_(Mode::PR),
         mode_machine_(0) {
-    ChannelFactory::Instance()->Init(0, networkInterface);
+    ChannelFactory::Instance()->Init(0, networkInterface);//建立通讯网
 
     // try to shutdown motion control-related service
-    msc_ = std::make_shared<unitree::robot::b2::MotionSwitcherClient>();
-    msc_->SetTimeout(5.0f);
-    msc_->Init();
+    msc_ = std::make_shared<unitree::robot::b2::MotionSwitcherClient>();//创建一个叫msc的切换员。是和机器人原厂服务之间沟通的桥梁
+    msc_->SetTimeout(5.0f);// 设置 5 秒超时，防止网络卡死
+    msc_->Init();// 建立连接
     std::string form, name;
+    //// 检查当前机器人正在运行什么模式 (CheckMode)；如果 name 不为空 (!name.empty())，说明机器人还被原厂模式控制着
     while (msc_->CheckMode(form, name), !name.empty()) {
+      // 尝试释放当前模式 (ReleaseMode)
       if (msc_->ReleaseMode())
-        std::cout << "Failed to switch to Release Mode\n";
-      sleep(5);
+        std::cout << "Failed to switch to Release Mode\n"; // 如果失败了报错
+      // 休息 5 秒再检查一次，直到机器人彻底进入“自由模式（Release Mode）”
+        sleep(5);
     }
 
-    // create publisher
+    // create publisher 创建发布者：负责把 LowCmd_ 指令发送到 HG_CMD_TOPIC 频道
     lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
     lowcmd_publisher_->InitChannel();
-    // create subscriber
+    // create subscriber 创建订阅者：负责监听 HG_STATE_TOPIC 和 HG_IMU_TORSO频道里的机器人状态
+    // 这里使用了 bind 绑定：一旦收到新状态，立即自动调用 LowStateHandler 函数
     lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
     lowstate_subscriber_->InitChannel(std::bind(&G1Example::LowStateHandler, this, std::placeholders::_1), 1);
     imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
     imutorso_subscriber_->InitChannel(std::bind(&G1Example::imuTorsoHandler, this, std::placeholders::_1), 1);
     // create threads
+    // 创建“指令发送”线程：每 2000 微秒（2ms）执行一次 LowCommandWriter
     command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, 2000, &G1Example::LowCommandWriter, this);
+    // 创建“运动计算”线程：每 2000 微秒（2ms）执行一次 Control
     control_thread_ptr_ = CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, 2000, &G1Example::Control, this);
   }
 
@@ -215,7 +221,7 @@ class G1Example {
     if (counter_ % 500 == 0)//IMU数据刷新很快，每 500 次才打印一次，大约一秒钟一次，降频显示。
       printf("IMU.torso.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]); //把三个轴的角度打印出来，保留两位小数
   }
-//情报中心。回调函数。每当机器人发送一个LowState数据包，这个函数就会被调用。
+//情报中心。回调函数。每当机器人发送一个LowState数据包，这个函数就会被调用。这个函数是运行在接收线程里的。
   void LowStateHandler(const void *message) {
     LowState_ low_state = *(const LowState_ *)message;
     //CRC检验
@@ -225,78 +231,78 @@ class G1Example {
     }
 
     // get motor state
-    MotorState ms_tmp;
+    MotorState ms_tmp;//局部变量，存储电机的数据
     for (int i = 0; i < G1_NUM_MOTOR; ++i) {//遍历 29 个电机，把每个电机的角度（q）和速度（dq）存好。如果电机报错，打印错误日志。
-      ms_tmp.q.at(i) = low_state.motor_state()[i].q();
+      ms_tmp.q.at(i) = low_state.motor_state()[i].q(); //low_state.motor_state()[i] -- 从网络收到的原始数据包，里面包含第 i 个电机的各种原始信息。
       ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();
-      if (low_state.motor_state()[i].motorstate() && i <= RightAnkleRoll)
+      if (low_state.motor_state()[i].motorstate() && i <= RightAnkleRoll)//正常运行下 为0；程序筛选出了下半身所有核心电机
         std::cout << "[ERROR] motor " << i << " with code " << low_state.motor_state()[i].motorstate() << "\n";
     }
-    motor_state_buffer_.SetData(ms_tmp);
+    motor_state_buffer_.SetData(ms_tmp);//将局部装满数据的ms_tmp 拷贝进全局共享的 motor_state_buffer_ 中。跨线程搬运
 
     // get imu state
-    ImuState imu_tmp;
-    imu_tmp.omega = low_state.imu_state().gyroscope();
-    imu_tmp.rpy = low_state.imu_state().rpy();
-    imu_state_buffer_.SetData(imu_tmp);
+    ImuState imu_tmp;//在栈空间里临时创建一个 ImuState 结构体实例。
+    imu_tmp.omega = low_state.imu_state().gyroscope();//获取陀螺仪数据，角速度
+    imu_tmp.rpy = low_state.imu_state().rpy();//获取姿态角，获取 Roll（翻滚）、Pitch（俯仰）、Yaw（偏航）
+    imu_state_buffer_.SetData(imu_tmp);//存入安全中转站
 
     // update gamepad
-    memcpy(rx_.buff, &low_state.wireless_remote()[0], 40);
-    gamepad_.update(rx_.RF_RX);
+    memcpy(rx_.buff, &low_state.wireless_remote()[0], 40);//暴力搬运函数。从存储无线遥控信号的起始地址&low_state.wireless_remote()[0]搬到临时缓存区rx_.buff。
+    gamepad_.update(rx_.RF_RX);//翻译成“人话”
 
     // update mode machine
-    if (mode_machine_ != low_state.mode_machine()) {
-      if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
-      mode_machine_ = low_state.mode_machine();
+    if (mode_machine_ != low_state.mode_machine()) {//检查当前记录的状态 mode_machine_ 是否与机器人刚刚发回来的 low_state.mode_machine() 不一致
+      if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;//打印机器人型号
+      mode_machine_ = low_state.mode_machine();//把最新的模式值保存到本地变量 mode_machine_ 中。
     }
 
-    // report robot status every second
-    if (++counter_ % 500 == 0) {
+    // report robot status every second 打印报告机器人的状态
+    if (++counter_ % 500 == 0) {//每次函数被调用（即收到新数据），计数器就加 1；只有当计数器是 500 的倍数时才进入大括号
       counter_ = 0;
       // IMU
       auto &rpy = low_state.imu_state().rpy();
-      printf("IMU.pelvis.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);
+      printf("IMU.pelvis.rpy: %.2f %.2f %.2f\n", rpy[0], rpy[1], rpy[2]);//骨盆（Pelvis）的倾斜角度。这是判断机器人是否由于脚踝摆动导致身体不稳的最直接数据。
 
-      // RC
+      // RC 遥控器 手柄上的 A、B、X、Y 键是否被按下。
       printf("gamepad_.A.pressed: %d\n", static_cast<int>(gamepad_.A.pressed));
       printf("gamepad_.B.pressed: %d\n", static_cast<int>(gamepad_.B.pressed));
       printf("gamepad_.X.pressed: %d\n", static_cast<int>(gamepad_.X.pressed));
       printf("gamepad_.Y.pressed: %d\n", static_cast<int>(gamepad_.Y.pressed));
 
-      // Motor
+      // Motor 电机全状态
       auto &ms = low_state.motor_state();
       printf("All %d Motors:", G1_NUM_MOTOR);
       printf("\nmode: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].mode());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].mode());//控制模式
       printf("\npos: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].q());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].q());//实时角度
       printf("\nvel: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].dq());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].dq());//转动速度
       printf("\ntau_est: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].tau_est());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].tau_est());//估算力矩
       printf("\ntemperature: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%d,%d;", ms[i].temperature()[0], ms[i].temperature()[1]);
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%d,%d;", ms[i].temperature()[0], ms[i].temperature()[1]);//温度
       printf("\nvol: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].vol());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%.2f,", ms[i].vol());//电压
       printf("\nsensor: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u;", ms[i].sensor()[0], ms[i].sensor()[1]);
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u;", ms[i].sensor()[0], ms[i].sensor()[1]);//传感器
       printf("\nmotorstate: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].motorstate());
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,", ms[i].motorstate());//报错码
       printf("\nreserve: ");
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u,%u,%u;", ms[i].reserve()[0], ms[i].reserve()[1], ms[i].reserve()[2], ms[i].reserve()[3]);
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) printf("%u,%u,%u,%u;", ms[i].reserve()[0], ms[i].reserve()[1], ms[i].reserve()[2], ms[i].reserve()[3]);//预留位
       printf("\n");
     }
   }
 
-  void LowCommandWriter() {
+  void LowCommandWriter() {//把你在程序里算好的“理想动作”，打包成机器人硬件能听懂的二进制格式，然后通过网络“发射”出去。
     LowCmd_ dds_low_command;
     dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
     dds_low_command.mode_machine() = mode_machine_;
 
     const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetData();
     if (mc) {
-      for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
-        dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
+      for (size_t i = 0; i < G1_NUM_MOTOR; i++) {//把自己定义的 MotorCommand 里的数据 填进宇树标准的 dds_low_command 盒子里
+        dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable 1代表电机启用
         dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
         dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
         dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
@@ -304,16 +310,16 @@ class G1Example {
         dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
       }
 
-      dds_low_command.crc() = Crc32Core((uint32_t *)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-      lowcmd_publisher_->Write(dds_low_command);
+      dds_low_command.crc() = Crc32Core((uint32_t *)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);//CRC校验
+      lowcmd_publisher_->Write(dds_low_command);//发送指令
     }
   }
 
   void Control() {
-    MotorCommand motor_command_tmp;
-    const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+    MotorCommand motor_command_tmp;//创建临时的动作清单,指令清单。
+    const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();// 从Buffer里获取机器人当前的实际位置
 
-    for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+    for (int i = 0; i < G1_NUM_MOTOR; ++i) {//先把29个电机设置好默认的kp和kd。电机的目标位置默认为0
       motor_command_tmp.tau_ff.at(i) = 0.0;
       motor_command_tmp.q_target.at(i) = 0.0;
       motor_command_tmp.dq_target.at(i) = 0.0;
@@ -321,32 +327,33 @@ class G1Example {
       motor_command_tmp.kd.at(i) = Kd[i];
     }
 
-    if (ms) {
-      time_ += control_dt_;
+    if (ms) {//如果成功拿到了机器人的当前状态，才开始指挥
+      time_ += control_dt_;//计时器累加
       if (time_ < duration_) {
-        // [Stage 1]: set robot to zero posture
+        // [Stage 1]: set robot to zero posture 平滑立正（0 ~ duration_ 秒）
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-          double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
-          motor_command_tmp.q_target.at(i) = (1.0 - ratio) * ms->q.at(i);
+          double ratio = std::clamp(time_ / duration_, 0.0, 1.0);//从 0% 慢慢变成 100%
+          motor_command_tmp.q_target.at(i) = (1.0 - ratio) * ms->q.at(i);//ms->q是机器人此刻真实的关节角度。采用线形插值将q慢慢变到0.
         }
       } else if (time_ < duration_ * 2) {
-        // [Stage 2]: swing ankle using PR mode
-        mode_pr_ = Mode::PR;
-        double max_P = M_PI * 30.0 / 180.0;
-        double max_R = M_PI * 10.0 / 180.0;
-        double t = time_ - duration_;
-        double L_P_des = max_P * std::sin(2.0 * M_PI * t);
-        double L_R_des = max_R * std::sin(2.0 * M_PI * t);
-        double R_P_des = max_P * std::sin(2.0 * M_PI * t);
-        double R_R_des = -max_R * std::sin(2.0 * M_PI * t);
-
+        // [Stage 2]: swing ankle using PR mode PR 模式（前后/左右摇摆）
+        mode_pr_ = Mode::PR;//告诉机器人：现在用“俯仰/翻滚”模式来理解我的指令
+        double max_P = M_PI * 30.0 / 180.0; //定义摆动幅度：俯仰最大 30度（转化为弧度）
+        double max_R = M_PI * 10.0 / 180.0; //定义摆动幅度：翻滚最大 10度（转化为弧度）
+        double t = time_ - duration_; //这一阶段走过的时间 t
+        //利用正弦波 sin 计算当前时间对应的角度（从 -max 到 +max 循环）
+        double L_P_des = max_P * std::sin(2.0 * M_PI * t);// 左脚俯仰
+        double L_R_des = max_R * std::sin(2.0 * M_PI * t);// 左脚翻滚
+        double R_P_des = max_P * std::sin(2.0 * M_PI * t);// 右脚俯仰
+        double R_R_des = -max_R * std::sin(2.0 * M_PI * t);// 右脚翻滚
+        //把算好的角度填进对应的“穴位”里
         motor_command_tmp.q_target.at(LeftAnklePitch) = L_P_des;
         motor_command_tmp.q_target.at(LeftAnkleRoll) = L_R_des;
         motor_command_tmp.q_target.at(RightAnklePitch) = R_P_des;
         motor_command_tmp.q_target.at(RightAnkleRoll) = R_R_des;
       } else {
         // [Stage 3]: swing ankle using AB mode
-        mode_pr_ = Mode::AB;
+        mode_pr_ = Mode::AB;//切换到AB模式，指挥推杆。
         double max_A = M_PI * 30.0 / 180.0;
         double max_B = M_PI * 10.0 / 180.0;
         double t = time_ - duration_ * 2;
@@ -360,19 +367,20 @@ class G1Example {
         motor_command_tmp.q_target.at(RightAnkleA) = R_A_des;
         motor_command_tmp.q_target.at(RightAnkleB) = R_B_des;
       }
-
+      //这一毫秒辛苦算好的“指令单”塞进保险柜；另一个线程会立刻把它取走发给电机
       motor_command_buffer_.SetData(motor_command_tmp);
     }
   }
 };
 
-int main(int argc, char const *argv[]) {
+int main(int argc, char const *argv[]) {//argc 整数类型，表示命令行输入参数的个数; argv: 字符指针数组（字符串数组），存储具体的参数内容;
+  //argv[0] 永远是程序本身的名称,argv[1] 是你输入的第一个参数（在这里是网卡名称）
   if (argc < 2) {
     std::cout << "Usage: g1_ankle_swing_example network_interface" << std::endl;
-    exit(0);
+    exit(0); //立即终止整个进程
   }
   std::string networkInterface = argv[1];
-  G1Example custom(networkInterface);
+  G1Example custom(networkInterface);//在栈 (Stack) 上创建了一个名为 custom 的实例
   while (true) sleep(10);
   return 0;
 }
