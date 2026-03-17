@@ -1,43 +1,43 @@
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>//YAML 配置解析器
 
-#include <cmath>
-#include <memory>
-#include <mutex>
-#include <shared_mutex>
+#include <cmath>//数学库
+#include <memory>//动态内存管理头文件
+#include <mutex>//互斥锁
+#include <shared_mutex>//共享互斥锁
 
 // DDS
-#include <unitree/robot/channel/channel_publisher.hpp>
-#include <unitree/robot/channel/channel_subscriber.hpp>
+#include <unitree/robot/channel/channel_publisher.hpp>//用于将控制指令序列化后发布至指定的 Topic
+#include <unitree/robot/channel/channel_subscriber.hpp>//用于订阅机器人反馈的状态并触发回调函数
 
-// IDL
+// IDL 接口定义语言
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
 
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
-using namespace unitree::robot::b2;
+using namespace unitree::robot::b2; // 访问运动切换客户端相关的类
 
-static const std::string HG_CMD_TOPIC = "rt/lowcmd";
-static const std::string HG_STATE_TOPIC = "rt/lowstate";
+static const std::string HG_CMD_TOPIC = "rt/lowcmd";// 底层指令发布的 DDS 话题名称
+static const std::string HG_STATE_TOPIC = "rt/lowstate";// 底层状态订阅的 DDS 话题名称
 
-using namespace unitree::common;
-using namespace unitree::robot;
+using namespace unitree::common; // 访问 SDK 通用工具类 
+using namespace unitree::robot; // 访问机器人底层通信相关的类
 
-const int G1_NUM_MOTOR = 29;
+const int G1_NUM_MOTOR = 29; //29个电机数
 
 template <typename T>
-class DataBuffer {
+class DataBuffer {//这个类的设计保证了：你拿到的每一包数据，要么是完整的上一时刻状态，要么是完整的当前时刻状态，绝不会是中间态。
  public:
-  void SetData(const T &newData) {
+  void SetData(const T &newData) {//写入操作 - 排他锁
     std::unique_lock<std::shared_mutex> lock(mutex);
     data = std::make_shared<T>(newData);
   }
 
-  std::shared_ptr<const T> GetData() {
+  std::shared_ptr<const T> GetData() {//读取操作 - 共享锁
     std::shared_lock<std::shared_mutex> lock(mutex);
     return data ? data : nullptr;
   }
 
-  void Clear() {
+  void Clear() {//清理操作
     std::unique_lock<std::shared_mutex> lock(mutex);
     data = nullptr;
   }
@@ -47,12 +47,12 @@ class DataBuffer {
   std::shared_mutex mutex;
 };
 
-struct ImuState {
+struct ImuState {//惯性测量单元状态
   std::array<float, 3> rpy = {};
   std::array<float, 3> omega = {};
 };
 
-struct MotorCommand {
+struct MotorCommand {//电机控制指令。这是程序发送给硬件的“任务单”。
   std::array<float, G1_NUM_MOTOR> q_target = {};
   std::array<float, G1_NUM_MOTOR> dq_target = {};
   std::array<float, G1_NUM_MOTOR> kp = {};
@@ -60,14 +60,14 @@ struct MotorCommand {
   std::array<float, G1_NUM_MOTOR> tau_ff = {};
 };
 
-struct MotorState {
+struct MotorState {//电机实时状态。这是机器人硬件回传给程序的“反馈单”。
   std::array<float, G1_NUM_MOTOR> q = {};
   std::array<float, G1_NUM_MOTOR> dq = {};
 };
 
-enum MotorType { GearboxS = 0, GearboxM = 1, GearboxL = 2 };
+enum MotorType { GearboxS = 0, GearboxM = 1, GearboxL = 2 };//三种减速器。小中大
 
-std::array<MotorType, G1_NUM_MOTOR> G1MotorType{
+std::array<MotorType, G1_NUM_MOTOR> G1MotorType{//按照索引顺序记录了机器人全身每一个关节对应的电机型号。
     // clang-format off
     // legs
     GearboxM, GearboxM, GearboxM, GearboxL, GearboxS, GearboxS,
@@ -80,9 +80,9 @@ std::array<MotorType, G1_NUM_MOTOR> G1MotorType{
     // clang-format on
 };
 
-enum PRorAB { PR = 0, AB = 1 };
+enum PRorAB { PR = 0, AB = 1 };//运动学解算模式
 
-enum G1JointValidIndex {
+enum G1JointValidIndex {//关节索引地图
   LeftShoulderPitch = 15,
   LeftShoulderRoll = 16,
   LeftShoulderYaw = 17,
@@ -121,7 +121,7 @@ inline uint32_t Crc32Core(uint32_t *ptr, uint32_t len) {
   return CRC32;
 };
 
-float GetMotorKp(MotorType type) {
+float GetMotorKp(MotorType type) {//刚度分配器
   switch (type) {
     case GearboxS:
       return 40;
@@ -134,7 +134,7 @@ float GetMotorKp(MotorType type) {
   }
 }
 
-float GetMotorKd(MotorType type) {
+float GetMotorKd(MotorType type) {//阻尼分配器
   switch (type) {
     case GearboxS:
       return 1;
@@ -149,42 +149,42 @@ float GetMotorKd(MotorType type) {
 
 class G1Example {
  private:
-  double time_;
-  double control_dt_;  // [2ms]
-  double duration_;    // [3 s]
-  PRorAB mode_;
-  uint8_t mode_machine_;
-  std::vector<std::vector<double>> frames_data_;
+  double time_;// 运行时间计数器，记录程序启动了多久
+  double control_dt_;  // [2ms]控制周期
+  double duration_;    // [3 s]动作时长基准
+  PRorAB mode_;// 控制模式，决定是 PR 还是 AB 解算
+  uint8_t mode_machine_;// 状态机标志，记录机器人当前的运行模式
+  std::vector<std::vector<double>> frames_data_;//二维动态数组。离线轨迹存储
 
-  DataBuffer<MotorState> motor_state_buffer_;
-  DataBuffer<MotorCommand> motor_command_buffer_;
-  DataBuffer<ImuState> imu_state_buffer_;
+  DataBuffer<MotorState> motor_state_buffer_;// 存放电机回传的状态
+  DataBuffer<MotorCommand> motor_command_buffer_;// 存放待发送的电机指令
+  DataBuffer<ImuState> imu_state_buffer_;// 存放惯导反馈的姿态
 
-  ChannelPublisherPtr<unitree_hg::msg::dds_::LowCmd_> lowcmd_publisher_;
-  ChannelSubscriberPtr<unitree_hg::msg::dds_::LowState_> lowstate_subscriber_;
-  ThreadPtr command_writer_ptr_, control_thread_ptr_;
+  ChannelPublisherPtr<unitree_hg::msg::dds_::LowCmd_> lowcmd_publisher_;// DDS 发布者：负责把指令“广播”给机器人
+  ChannelSubscriberPtr<unitree_hg::msg::dds_::LowState_> lowstate_subscriber_;// DDS 订阅者：负责从机器人那里“收听”状态
+  ThreadPtr command_writer_ptr_, control_thread_ptr_;// 线程句柄：管理程序的后台运行任务
 
-  std::shared_ptr<MotionSwitcherClient> msc;
+  std::shared_ptr<MotionSwitcherClient> msc;// 运动模式切换客户端：用于控制机器人的高/低层模式切换
 
  public:
-  G1Example(std::string networkInterface)
-      : time_(0.0),
+  G1Example(std::string networkInterface)//构造函数
+      : time_(0.0),//初始化列表
         control_dt_(0.002),
         duration_(3.0),
         mode_(PR),
         mode_machine_(0) {
-    ChannelFactory::Instance()->Init(0, networkInterface);
+    ChannelFactory::Instance()->Init(0, networkInterface);//打开网口，激活通讯引擎
 
-    msc.reset(new MotionSwitcherClient());
-    msc->SetTimeout(5.0F);
-    msc->Init();
+    msc.reset(new MotionSwitcherClient());//创建模式切换遥控器。实例化一个专门用来和机器人“系统管家”对话的工具
+    msc->SetTimeout(5.0F);//设置耐心极限
+    msc->Init();//连接管理中心
 
-    /*Shut down  motion control-related service*/
+    /*Shut down  motion control-related service*/ //强制停用官方运动服务
     while(queryMotionStatus())
     {
         std::cout << "Try to deactivate the motion control-related service." << std::endl;
         int32_t ret = msc->ReleaseMode(); 
-        if (ret == 0) {
+        if (ret == 0) {//说明发送成功
             std::cout << "ReleaseMode succeeded." << std::endl;
         } else {
             std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
@@ -192,24 +192,24 @@ class G1Example {
         sleep(5);
     }
 
-    loadBehaviorLibrary("motion");
+    loadBehaviorLibrary("motion");//加载动作剧本。会根据宏定义的路径寻找 motion.seq 文件，并将其反序列化到内存变量 frames_data_ 中
 
-    // create publisher
-    lowcmd_publisher_.reset(
+    // create publisher发布者
+    lowcmd_publisher_.reset(//初始化智能指针
         new ChannelPublisher<unitree_hg::msg::dds_::LowCmd_>(HG_CMD_TOPIC));
-    lowcmd_publisher_->InitChannel();
+    lowcmd_publisher_->InitChannel();//正式在网络协议栈中注册这个发布频道
 
-    // create subscriber
+    // create subscriber订阅者
     lowstate_subscriber_.reset(
         new ChannelSubscriber<unitree_hg::msg::dds_::LowState_>(
             HG_STATE_TOPIC));
     lowstate_subscriber_->InitChannel(
-        std::bind(&G1Example::LowStateHandler, this, std::placeholders::_1), 1);
+        std::bind(&G1Example::LowStateHandler, this, std::placeholders::_1), 1);//回调函数
 
     // create threads
     command_writer_ptr_ =
-        CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, 2000,
-                                &G1Example::LowCommandWriter, this);
+        CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, 2000,//创建一个定时循环线程,线程的名字是command_writer，
+                                &G1Example::LowCommandWriter, this);//成员函数指针，入口函数，告诉线程：“你每次醒来时，就去跑这个函数”。
     control_thread_ptr_ = CreateRecurrentThreadEx(
         "control", UT_CPU_ID_NONE, 2000, &G1Example::Control, this);
   }
