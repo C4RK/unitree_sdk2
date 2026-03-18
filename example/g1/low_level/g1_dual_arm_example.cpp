@@ -214,44 +214,44 @@ class G1Example {
         "control", UT_CPU_ID_NONE, 2000, &G1Example::Control, this);
   }
 
-  void loadBehaviorLibrary(std::string behavior_name) {
-    std::string resource_dir = BLIB_DIR;
-    YAML::Node motion = YAML::LoadFile(resource_dir + behavior_name + ".seq");
+  void loadBehaviorLibrary(std::string behavior_name) {//从磁盘读取离线轨迹文件（.seq），并将其解析为程序可以高效访问的内存矩阵
+    std::string resource_dir = BLIB_DIR;// 获取文件夹路径
+    YAML::Node motion = YAML::LoadFile(resource_dir + behavior_name + ".seq");//将该文本文件加载进内存，形成一个类似字典的树状结构 motion
 
-    std::string content = motion["components"][1]["content"].as<std::string>();
+    std::string content = motion["components"][1]["content"].as<std::string>();//访问特定节点，类型转换成string。获取这段轨迹的描述和涉及的部件数量。
     int num_parts = motion["components"][1]["num_parts"].as<int>();
-    std::cout << "BehaviorName: " << behavior_name + ".seq\n";
-    std::cout << content << " with " << num_parts << "\n";
+    std::cout << "BehaviorName: " << behavior_name + ".seq\n";// 读取这段动作的名字
+    std::cout << content << " with " << num_parts << "\n";// 读取它包含多少个关节
 
-    auto frames = motion["components"][1]["frames"];
+    auto frames = motion["components"][1]["frames"];// 找到文件中存放所有动作帧的部分
 
-    for (const auto &frame : frames) {
-      std::vector<double> frame_data;
-      for (const auto &element : frame) {
-        frame_data.push_back(element.as<double>());
+    for (const auto &frame : frames) {// 遍历每一时刻（每一行）
+      std::vector<double> frame_data;// 准备一个小盒子装这一时刻的关节角度
+      for (const auto &element : frame) {// 遍历该时刻下的所有关节角度（每一列）
+        frame_data.push_back(element.as<double>());// 把文本“0.5”变成数字 0.5 存进去
       }
-      frames_data_.push_back(frame_data);
+      frames_data_.push_back(frame_data);// 存入类的成员变量矩阵。frames_data_ 现在就像一张表格。每一行代表一个时间点的全身（或双臂）姿态，每一列代表某个具体电机的目标角度。
     }
 
     std::cout << frames_data_.size() << " knots with " << frames_data_[0].size()
               << " DOF\n";
   }
 
-  void ReportRPY() {
-    const std::shared_ptr<const ImuState> imu_tmp_ptr =
+  void ReportRPY() {//从内存中提取并打印机器人当前的RPY角度
+    const std::shared_ptr<const ImuState> imu_tmp_ptr =//指向常量的智能指针，
         imu_state_buffer_.GetData();
-    if (imu_tmp_ptr) {
+    if (imu_tmp_ptr) {//空指针检查
       std::cout << "rpy: [" << imu_tmp_ptr->rpy.at(0) << ", "
                 << imu_tmp_ptr->rpy.at(1) << ", " << imu_tmp_ptr->rpy.at(2)
-                << "]" << std::endl;
+                << "]" << std::endl;//访问结构体ImuState里的rpy数组。
     }
   }
 
-  void LowStateHandler(const void *message) {
+  void LowStateHandler(const void *message) {//底层通讯传过来的原始内存地址
     unitree_hg::msg::dds_::LowState_ low_state =
         *(const unitree_hg::msg::dds_::LowState_ *)message;
 
-    if (low_state.crc() !=
+    if (low_state.crc() !=//CRC 循环冗余校验
         Crc32Core((uint32_t *)&low_state,
                   (sizeof(unitree_hg::msg::dds_::LowState_) >> 2) - 1)) {
       std::cout << "low_state CRC Error" << std::endl;
@@ -261,10 +261,10 @@ class G1Example {
     // get motor state
     MotorState ms_tmp;
     for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-      ms_tmp.q.at(i) = low_state.motor_state()[i].q();
-      ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();
+      ms_tmp.q.at(i) = low_state.motor_state()[i].q();// 获取实际角度
+      ms_tmp.dq.at(i) = low_state.motor_state()[i].dq();// 获取实际速度
     }
-    motor_state_buffer_.SetData(ms_tmp);
+    motor_state_buffer_.SetData(ms_tmp);// 存入带锁的缓冲区
 
     // get imu state
     ImuState imu_tmp;
@@ -272,7 +272,7 @@ class G1Example {
     imu_tmp.rpy = low_state.imu_state().rpy();
     imu_state_buffer_.SetData(imu_tmp);
 
-    // update mode machine
+    // update mode machine 记录机器人当前的运行模式
     if (mode_machine_ != low_state.mode_machine()) {
       if (mode_machine_ == 0)
         std::cout << "G1 type: " << unsigned(low_state.mode_machine())
@@ -281,38 +281,38 @@ class G1Example {
     }
   }
 
-  void LowCommandWriter() {
-    unitree_hg::msg::dds_::LowCmd_ dds_low_command;
+  void LowCommandWriter() {//把计算出来的指令打包，贴上防伪标签（CRC），然后通过网线准确地传达给每一个电机
+    unitree_hg::msg::dds_::LowCmd_ dds_low_command;//在内存中开辟空间，创建一个指令结构体对象
     dds_low_command.mode_pr() = mode_;
     dds_low_command.mode_machine() = mode_machine_;
 
-    const std::shared_ptr<const MotorCommand> mc =
+    const std::shared_ptr<const MotorCommand> mc =//拿出计算好的最新指令mc
         motor_command_buffer_.GetData();
-    if (mc) {
+    if (mc) {//指令转换与填充
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
-        dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable
-        dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-        dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-        dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-        dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-        dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+        dds_low_command.motor_cmd().at(i).mode() = 1;  // 1:Enable, 0:Disable使能电机
+        dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);//前馈力矩
+        dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);// 目标角度
+        dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);// 目标速度
+        dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);// 比例增益（刚度）
+        dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);// 微分增益（阻尼）
       }
 
-      dds_low_command.crc() = Crc32Core((uint32_t *)&dds_low_command,
+      dds_low_command.crc() = Crc32Core((uint32_t *)&dds_low_command,//贴上安全标签
                                         (sizeof(dds_low_command) >> 2) - 1);
-      lowcmd_publisher_->Write(dds_low_command);
+      lowcmd_publisher_->Write(dds_low_command);//发出
     }
   }
 
   void Control() {
-    MotorCommand motor_command_tmp;
-    const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();
+    MotorCommand motor_command_tmp;// 准备存计算结果的临时盒子
+    const std::shared_ptr<const MotorState> ms = motor_state_buffer_.GetData();// 拿到最新的关节角度
 
     if (ms) {
-      time_ += control_dt_;
+      time_ += control_dt_;//每次进来，时间指针就往前推 2ms
       if (time_ < duration_) {
-        // [Stage 1]: set robot to zero posture
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        // [Stage 1]: set robot to zero posture 平滑归零 (Soft Start / Zero Posture)
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {//在 3 秒内，让关节从当前角度平滑地移动到 0 度。ratio 越接近 1，就离 0 度越近。
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
 
           double q_des = 0;
@@ -324,10 +324,10 @@ class G1Example {
           motor_command_tmp.kd.at(i) = GetMotorKd(G1MotorType[i]);
         }
       } else {
-        // [Stage 2]: tracking the offline trajectory
-        size_t frame_index = (size_t)((time_ - duration_) / control_dt_);
-        if (frame_index >= frames_data_.size()) {
-          frame_index = frames_data_.size() - 1;
+        // [Stage 2]: tracking the offline trajectory 执行剧本
+        size_t frame_index = (size_t)((time_ - duration_) / control_dt_);//计算当前时间对应 frames_data_ 矩阵里的哪一行。
+        if (frame_index >= frames_data_.size()) {//如果播放完毕
+          frame_index = frames_data_.size() - 1;//强行停在最后一行
           time_ = 0.0;  // RESET
         }
 
@@ -337,7 +337,7 @@ class G1Example {
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
           size_t index_in_frame = i - LeftShoulderPitch;
           motor_command_tmp.q_target.at(i) =
-              (i >= LeftShoulderPitch)
+              (i >= LeftShoulderPitch)//如果关节是肩膀及以下，就去查剧本里的角度。如果是下半身关节，保持 0 度
                   ? frames_data_[frame_index][index_in_frame]
                   : 0.0;
           motor_command_tmp.dq_target.at(i) = 0.0;
@@ -351,7 +351,7 @@ class G1Example {
     }
   }
 
-  std::string queryServiceName(std::string form,std::string name)
+  std::string queryServiceName(std::string form,std::string name)//逻辑映射表，根据输入的机器人“形态”和“版本名称”，返回对应的服务名称
   {
       if(form == "0")
       {
@@ -367,11 +367,11 @@ class G1Example {
       return "";
   }
 
-  int queryMotionStatus()
+  int queryMotionStatus()//运动状态问讯
   {
       std::string robotForm,motionName;
       int motionStatus;
-      int32_t ret = msc->CheckMode(robotForm,motionName);
+      int32_t ret = msc->CheckMode(robotForm,motionName);//向机器人发送一个请求，询问当前的硬件状态
       if (ret == 0) {
           std::cout << "CheckMode succeeded." << std::endl;
       } else {
@@ -379,7 +379,7 @@ class G1Example {
       }
       if(motionName.empty())
       {
-          std::cout << "The motion control-related service is deactivated." << std::endl;
+          std::cout << "The motion control-related service is deactivated." << std::endl;//没有运行
           motionStatus = 0;
       }
       else
